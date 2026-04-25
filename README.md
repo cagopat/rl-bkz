@@ -1,7 +1,80 @@
-# RL-BKZ: Reinforcement Learning for Adaptive Lattice Reduction
+# RL-BKZ: Learning Adaptive BKZ Schedules via Reinforcement Learning
 
-A minimal prototype that uses DQN to learn adaptive BKZ block-size schedules,
-benchmarked against fixed and progressive baselines on random lattice instances.
+A DQN agent that learns adaptive BKZ block-size schedules for lattice basis reduction and transfers to lattice dimensions it was never trained on.
+
+---
+
+## Key Results
+
+**The agent is trained on n ∈ [40, 65] and evaluated zero-shot on n = 70–110.**
+
+### Equal-tour comparison (RL vs Progressive, paired t-test, n=100 instances)
+
+| n (unseen) | RL improvement | Progressive | Δ | p-value |
+|---|---|---|---|---|
+| 75 | 0.513 | 0.501 | +0.013 | 0.015 * |
+| 80 | 0.559 | 0.539 | +0.020 | 0.0003 *** |
+| 85 | 0.617 | 0.588 | +0.029 | <0.0001 *** |
+| 90 | 0.658 | 0.623 | +0.035 | <0.0001 *** |
+| 95 | 0.713 | 0.662 | +0.051 | <0.0001 *** |
+| 100 | 0.759 | 0.713 | +0.046 | <0.0001 *** |
+| 105 | 0.798 | 0.745 | +0.053 | <0.0001 *** |
+| 110 | 0.842 | 0.777 | +0.065 | <0.0001 *** |
+
+The effect grows with dimension — the further outside the training range, the larger the advantage.
+
+### The agent is cheaper than Fixed BKZ-30, not more expensive
+
+At small-to-mid n the agent mixes cheap and expensive tours intelligently:
+
+| n | Fixed BKZ-30 | RL (DQN) | RL cheaper by |
+|---|---|---|---|
+| 70 | 0.034 s/tour | 0.018 s/tour | 1.9× |
+| 80 | 0.045 s/tour | 0.031 s/tour | 1.5× |
+| 90 | 0.061 s/tour | 0.053 s/tour | 1.2× |
+| 100 | 0.081 s/tour | 0.080 s/tour | ≈ equal |
+| 110 | 0.105 s/tour | 0.105 s/tour | identical |
+
+At large n the agent converges to always selecting BKZ-30, which is optimal and expected. At small n it learns that a mix of BKZ-10 and BKZ-25 gets similar quality for less compute.
+
+
+---
+
+## How it works
+
+### State (dimension-invariant)
+
+The raw GS log-norm profile has n components and changes size with n. We fix this by interpolating to 32 evenly-spaced points, then appending 4 scalars:
+
+```
+[ interp_GS_profile[0..31],   # shape of the basis, fixed 32 points
+  GS slope,                    # how far from flat (= fully reduced)
+  log-RHF estimate,            # single-number quality proxy
+  n_norm,                      # normalised lattice dimension
+  step_frac ]                  # episode progress
+```
+
+Total: 36 floats, same shape for n=40 or n=110.
+
+### Action
+
+```python
+BLOCK_SIZES = [10, 15, 20, 25, 30]
+```
+
+Each action runs one BKZ tour at that block size.
+
+### Reward
+
+```
+r_t = 100 * ( log‖b₁^(t)‖ − log‖b₁^(t+1)‖ − λ · wall_time )
+```
+
+Positive when the first basis vector gets shorter. `λ=0.1` penalises expensive tours.
+
+### Agent
+
+Standard DQN: 2-layer MLP (128 hidden, ReLU), Huber loss, Adam, replay buffer (20k), hard target sync every 200 learn steps, linear ε-greedy decay.
 
 ---
 
@@ -10,125 +83,62 @@ benchmarked against fixed and progressive baselines on random lattice instances.
 ```bash
 pip install -r requirements.txt
 
-# Train (≈ 400 episodes, n=40, 20 tours/episode)
-python train.py
+# Multi-dimension training (the main experiment)
+python train.py --n_range 40 65 --episodes 800 --max_steps 25 \
+    --lam 0.1 --save bkz_dqn_transfer.pt
 
-# Evaluate against all baselines
-python evaluate.py
+# Transfer evaluation on unseen dimensions
+python evaluate.py --transfer --model bkz_dqn_transfer.pt \
+    --test_dims 70 75 80 85 90 95 100 105 110 --n_test 50 --max_steps 25
+
+# Statistical significance (paired t-test vs Progressive)
+python ttest.py --test_type improvement \
+    --dims 70 75 80 85 90 95 100 105 110 --n_test 100 --max_steps 25
+
+# Single-dimension baseline table
+python train.py --n 60 --episodes 600 --max_steps 25 --lam 0.1 --save bkz_dqn_n60.pt
+python evaluate.py --n 60 --max_steps 25 --model bkz_dqn_n60.pt --n_test 50
 ```
-
-Both scripts accept `--help` for full option lists.
 
 ---
 
-## File overview
+## Files
 
 | File | Purpose |
 |------|---------|
-| `env.py` | `BKZEnv` gymnasium environment + lattice utilities |
-| `agent.py` | `DQNAgent` (Q-net, replay buffer, target net) |
-| `baselines.py` | Fixed BKZ-20/30, progressive, fplll-default schedules |
-| `train.py` | Training loop; saves `bkz_dqn.pt` + `train_metrics.json` |
-| `evaluate.py` | Comparison table + optional reduction-curve plot |
-
----
-
-## Design decisions
-
-### State
-
-```
-[ log‖b₁*‖, log‖b₂*‖, …, log‖bₙ*‖,   ← GS log-norm profile (n values)
-  GS slope,                              ← linear fit over GS indices
-  log-RHF estimate,                      ← (log‖b₁‖ − log det^{1/n}) / n
-  step / max_steps ]                     ← episode progress
-```
-
-The GS log-norm profile is the key signal: BKZ theory predicts that a good
-reduction flattens the profile, and the slope tells you how far you are from
-that ideal.  RHF is the standard single-number quality proxy.
-
-### Action
-
-Discrete: `β ∈ {10, 15, 20, 25, 30}` — each action runs one BKZ tour at
-that block size.
-
-### Reward
-
-```
-r_t = reward_scale * ( log‖b₁^(t)‖ − log‖b₁^(t+1)‖ − λ · wall_time )
-```
-
-- Positive = shorter first basis vector.
-- `λ` (default 0.05) penalises expensive tours; tune up/down to shift the
-  agent's compute budget.
-- `reward_scale` (default 100) keeps rewards O(1) so the Q-network trains
-  stably.
-
-### Agent
-
-Standard DQN:
-- 2-hidden-layer MLP (128 units, ReLU)
-- Huber loss, Adam optimiser
-- Linear ε-greedy decay over 3 000 env steps
-- Hard target-network sync every 200 learn steps
-- Replay buffer: 20 000 transitions
+| `env.py` | `BKZEnv` gymnasium environment, dimension-invariant state, lattice utilities |
+| `agent.py` | `DQNAgent` — Q-network, replay buffer, target network |
+| `baselines.py` | Fixed BKZ-20/30 and Progressive schedule baselines |
+| `train.py` | Training loop; supports `--n_range` for multi-dim training |
+| `evaluate.py` | Standard eval + transfer eval across dimensions, 4-panel plots |
+| `ttest.py` | Paired t-tests: equal-tour and fixed-budget comparisons |
+| `generate_strategies.py` | One-time setup for fplll pruning strategies (macOS only) |
 
 ---
 
 ## Baselines
 
-| Name | Description |
-|------|-------------|
+| Method | Description |
+|--------|-------------|
 | Fixed BKZ-20 | Always β = 20 |
-| Fixed BKZ-30 | Always β = 30 |
-| Progressive | 10 → 15 → 20 → 25 → 30 (cycling) |
-| fplll Default | β = 20 with `BKZ.DEFAULT_STRATEGY` (pruning + preprocessing) |
-| **RL (DQN)** | Greedy policy from trained agent |
+| Fixed BKZ-30 | Always β = 30, strongest single action |
+| Progressive | Cycles 10 → 15 → 20 → 25 → 30, hand-designed |
+| **RL (DQN)** | Learned policy, conditioned on current GS profile |
 
 ---
 
-## Extending the prototype
+## Limitations
 
-### Richer action space
-```python
-# (block_size, pruning_strength, early_termination)
-action_space = spaces.MultiDiscrete([5, 3, 2])
-```
-
-### Compressed state for variable n
-Replace the raw n-dimensional GS profile with:
-- Mean, variance, min, max of log-norms  
-- First k PCA components of the profile  
-- Slope + curvature of a quadratic fit  
-
-This makes the policy transferable across dimensions.
-
-### Better exploration
-- Noisy networks instead of ε-greedy  
-- Intrinsic reward for novel GS profiles  
-
-### Algorithm upgrades
-- Double DQN / Dueling DQN  
-- PPO (better for longer episodes)  
-- Multi-step returns (n=5) for faster propagation  
-
-### BKZ-2.0 features
-Once block-size control is working, extend to BKZ-2.0 knobs:
-- Pruning strength (fpylll `Pruning` object)  
-- Preprocessing block size  
-- Early termination threshold  
-
-### SVP Challenge instances
-Download from https://www.latticechallenge.org/svp-challenge/
-and pass them in via `evaluate.py --instances path/to/instances/`.
+- Action space is discrete and small (`β ∈ {10,...,30}`). The agent cannot beat Fixed BKZ-30 on raw quality since BKZ-30 is the strongest available action — extending to `{15, 20, 25, 30, 40}` would allow it.
+- Training uses random q-ary lattices. Transfer to structured instances (LWE, SVP Challenge) is untested.
+- Only block size is controlled. BKZ 2.0 also exposes pruning strength and preprocessing — extending the action space there is the natural next step.
+- Epsilon decays in the first 10% of training (first 80 of 800 episodes), leaving 90% of training near-greedy. More exploration budget may improve the policy.
 
 ---
 
-## Key references
+## References
 
-- Schnorr & Euchner (1994). Lattice Basis Reduction.
-- Chen & Nguyen (2011). BKZ 2.0.
-- Ducas (2021). Lattice Reduction – A Toolbox for the Cryptanalyst.
+- Aono et al. (2016). *Improved Progressive BKZ Algorithms and Their Precise Cost Estimation by Sharp Simulator.* EUROCRYPT.
+- Chen & Nguyen (2011). *BKZ 2.0: Better Lattice Security Estimates.* ASIACRYPT.
+- Schnorr & Euchner (1994). *Lattice Basis Reduction.*
 - fpylll: https://github.com/fplll/fpylll
-- TU Darmstadt SVP Challenge: https://www.latticechallenge.org/svp-challenge/
